@@ -10,6 +10,15 @@ if (!apiKey) {
 const app = express();
 app.use(express.json());
 
+// Diagnostic endpoint — remove after confirming env vars work
+app.get("/api/debug-env", (req, res) => {
+  res.json({
+    hasSitePassword: !!process.env.SITE_PASSWORD,
+    hasApiKey: !!process.env.ANTHROPIC_API_KEY,
+    nodeEnv: process.env.NODE_ENV || "not set",
+  });
+});
+
 // Password protection middleware
 const SITE_PASSWORD = process.env.SITE_PASSWORD;
 if (SITE_PASSWORD) {
