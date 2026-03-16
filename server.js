@@ -1,0 +1,264 @@
+const fs = require("fs");
+const express = require("express");
+const Anthropic = require("@anthropic-ai/sdk").default;
+const path = require("path");
+
+// Load API key from .env file
+const envPath = path.join(__dirname, ".env");
+let apiKey = process.env.ANTHROPIC_API_KEY;
+if (fs.existsSync(envPath)) {
+  const envContent = fs.readFileSync(envPath, "utf-8");
+  const match = envContent.match(/ANTHROPIC_API_KEY=(.+)/);
+  if (match) apiKey = match[1].trim();
+}
+
+if (!apiKey) {
+  console.error("ERROR: No ANTHROPIC_API_KEY found. Set it in .env or environment.");
+  process.exit(1);
+}
+
+const app = express();
+app.use(express.json());
+app.use(express.static(path.join(__dirname, "public")));
+
+const anthropic = new Anthropic({ apiKey });
+
+// PxWeb API base URLs
+const BASES = {
+  ssb: "https://data.ssb.no/api/v0/en/table",
+  scb: "https://api.scb.se/OV0104/v1/doris/en/ssd",
+  statfin: "https://pxdata.stat.fi/PXWeb/api/v1/en/StatFin",
+};
+
+// Tools for Claude
+const tools = [
+  {
+    name: "list_path",
+    description:
+      "List contents at a path in the statistical database. Use '/' for top-level categories. Each result has an 'id' (subfolder/table name), 'text' (human label), and 'type' ('l'=folder, 't'=table). Navigate by appending ids to the path, e.g. '/' -> '/be' -> '/be/be01'. For SSB, common top-level ids: 'be'=Population, 'al'=Labour, 'ei'=Energy, 'helse'=Health, 'inntekt'=Income, 'priser'=Prices, 'utdan'=Education.",
+    input_schema: {
+      type: "object",
+      properties: {
+        source: {
+          type: "string",
+          enum: ["ssb", "scb", "statfin"],
+          description: "ssb=Norway, scb=Sweden, statfin=Finland",
+        },
+        path: {
+          type: "string",
+          description: "Path to list, e.g. '/' or '/be/be01/folkemengde'",
+        },
+      },
+      required: ["source", "path"],
+    },
+  },
+  {
+    name: "get_table_info",
+    description:
+      "Get metadata for a specific table (type='t'). Returns variable names, codes, and available values. You need this before fetching data.",
+    input_schema: {
+      type: "object",
+      properties: {
+        source: { type: "string", enum: ["ssb", "scb", "statfin"] },
+        path: { type: "string", description: "Full path to the table" },
+      },
+      required: ["source", "path"],
+    },
+  },
+  {
+    name: "fetch_data",
+    description:
+      'Fetch data from a table. Build query from metadata. Use filter "item" with specific value codes, or "all" with ["*"] to get everything for a variable. Keep queries small - select only needed values.',
+    input_schema: {
+      type: "object",
+      properties: {
+        source: { type: "string", enum: ["ssb", "scb", "statfin"] },
+        path: { type: "string" },
+        query: {
+          type: "array",
+          items: {
+            type: "object",
+            properties: {
+              code: { type: "string" },
+              selection: {
+                type: "object",
+                properties: {
+                  filter: { type: "string" },
+                  values: { type: "array", items: { type: "string" } },
+                },
+              },
+            },
+          },
+        },
+      },
+      required: ["source", "path", "query"],
+    },
+  },
+];
+
+// Execute a tool call
+async function executeTool(name, input) {
+  const base = BASES[input.source];
+  if (!base) return { error: "Unknown source" };
+
+  try {
+    if (name === "list_path") {
+      const p = input.path === "/" ? "" : input.path;
+      const url = `${base}${p}`;
+      const resp = await fetch(url);
+      if (!resp.ok) return { error: `HTTP ${resp.status}` };
+      const data = await resp.json();
+      if (Array.isArray(data)) {
+        return data.slice(0, 30).map((d) => ({
+          id: d.id,
+          text: d.text,
+          type: d.type,
+        }));
+      }
+      return data;
+    }
+
+    if (name === "get_table_info") {
+      const url = `${base}${input.path}`;
+      const resp = await fetch(url);
+      if (!resp.ok) return { error: `HTTP ${resp.status}` };
+      const data = await resp.json();
+      if (data.variables) {
+        return {
+          title: data.title,
+          variables: data.variables.map((v) => ({
+            code: v.code,
+            text: v.text,
+            values: v.values?.slice(0, 30),
+            valueTexts: v.valueTexts?.slice(0, 30),
+            totalValues: v.values?.length,
+          })),
+        };
+      }
+      return data;
+    }
+
+    if (name === "fetch_data") {
+      const url = `${base}${input.path}`;
+      const resp = await fetch(url, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          query: input.query,
+          response: { format: "json" },
+        }),
+      });
+      if (!resp.ok) {
+        const text = await resp.text();
+        return { error: `HTTP ${resp.status}: ${text.slice(0, 300)}` };
+      }
+      const data = await resp.json();
+      if (data.data && data.data.length > 80) {
+        data.data = data.data.slice(0, 80);
+        data._note = "Truncated to 80 rows";
+      }
+      return data;
+    }
+
+    return { error: "Unknown tool" };
+  } catch (err) {
+    return { error: err.message };
+  }
+}
+
+const systemPrompt = `You are a statistics assistant helping users find Nordic statistics via PxWeb APIs.
+
+LANGUAGE: Always respond in the same language the user writes in. If they write in Norwegian, respond in Norwegian. If in Swedish, respond in Swedish. Match their language exactly.
+
+Sources: SSB (Norway), SCB (Sweden), StatFin (Finland). Default to SSB.
+
+IMPORTANT: Be efficient with tool calls. Navigate directly when you can:
+- For SSB population: list_path "/" to see categories, then drill into "be" (Population)
+- Tables have type "t", folders have type "l"
+- When you find a table (type "t"), use get_table_info to see its variables
+- Then fetch_data with appropriate filters
+- Try to reach data in 3-4 tool calls maximum
+
+Present results as clean markdown tables.
+
+TRANSPARENCY REQUIREMENTS — follow these strictly:
+1. Always include a direct verification link to the source table. Build it from the source and path:
+   - SSB: https://data.ssb.no/api/v0/en/table{path} (API) and https://www.ssb.no/statbank/table/{tableId}/ (web UI, tableId is the last segment e.g. "07459")
+   - SCB: https://api.scb.se/OV0104/v1/doris/en/ssd{path} (API) and https://www.statistikdatabasen.scb.se/pxweb/en/ssd{path} (web UI)
+   - StatFin: https://pxdata.stat.fi/PXWeb/api/v1/en/StatFin{path} (API) and https://pxdata.stat.fi/PXWeb/pxweb/en/StatFin{path} (web UI)
+   Present the web UI link so users can browse the table themselves.
+
+2. Clearly label what is raw data from the source vs what is your own analysis:
+   - Numbers in tables are directly from the statistical agency — say "Data from [agency name]"
+   - Any summaries, interpretations, key findings, trends, or commentary you write must be labeled as "AI-generated summary" or "AI analysis". For example: "**AI-generated summary:** Norway's population grew by 12% over this period."
+   - Never present your interpretations as if they came from the statistical agency.
+
+3. Briefly tell the user how to find the table themselves: e.g. "To find this table: go to [web UI link], navigate to [category] > [subcategory] > [table name]."`;
+
+
+// Chat endpoint
+app.post("/api/chat", async (req, res) => {
+  const { messages } = req.body;
+
+  try {
+    let currentMessages = [...messages];
+    let finalResponse = "";
+
+    // Agentic loop with generous limit
+    for (let i = 0; i < 15; i++) {
+      console.log(`[${i}] Calling Claude...`);
+      const response = await anthropic.messages.create({
+        model: "claude-sonnet-4-20250514",
+        max_tokens: 4096,
+        system: systemPrompt,
+        tools,
+        messages: currentMessages,
+      });
+
+      // Collect any text
+      const text = response.content
+        .filter((b) => b.type === "text")
+        .map((b) => b.text)
+        .join("\n");
+
+      const toolUses = response.content.filter((b) => b.type === "tool_use");
+
+      // If no tool calls, we're done
+      if (toolUses.length === 0) {
+        finalResponse = text;
+        break;
+      }
+
+      // If stop_reason is end_turn (text + tools), capture text and still run tools
+      if (response.stop_reason === "end_turn") {
+        finalResponse = text;
+        break;
+      }
+
+      // Execute tools
+      const toolResults = [];
+      for (const tu of toolUses) {
+        console.log(`  -> ${tu.name}(${JSON.stringify(tu.input).slice(0, 80)})`);
+        const result = await executeTool(tu.name, tu.input);
+        toolResults.push({
+          type: "tool_result",
+          tool_use_id: tu.id,
+          content: JSON.stringify(result),
+        });
+      }
+
+      currentMessages.push({ role: "assistant", content: response.content });
+      currentMessages.push({ role: "user", content: toolResults });
+    }
+
+    res.json({ response: finalResponse });
+  } catch (err) {
+    console.error("Error:", err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+const PORT = process.env.PORT || 3456;
+app.listen(PORT, () => {
+  console.log(`StatSearch running at http://localhost:${PORT}`);
+});
