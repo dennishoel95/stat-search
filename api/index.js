@@ -105,7 +105,13 @@ function loginPage() {
 </html>`;
 }
 
+// Serve static files — use includeFiles to ensure public/ is available on Vercel
 app.use(express.static(path.join(__dirname, "../public")));
+
+// Fallback: serve index.html for root path
+app.get("/", (req, res) => {
+  res.sendFile(path.join(__dirname, "../public/index.html"));
+});
 
 const anthropic = new Anthropic({ apiKey });
 
